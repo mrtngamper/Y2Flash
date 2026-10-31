@@ -6,8 +6,7 @@ you might want to move on now.
 # Y2Flash
 
 Flash a MediaTek firmware image (a folder, a `.zip` or a scatter file) to a
-device over USB. It is built for the Innioasis Y2 (MT6582). MT6572 support is
-wired up but untested. The protocol is ported from [mtkclient](https://github.com/bkerler/mtkclient), which also works fine,
+device over USB. It is built for the Innioasis Y2 (MT6582). The protocol is ported from [mtkclient](https://github.com/bkerler/mtkclient), which also works fine,
 if not better for this exact process. 
 
 ## Use
