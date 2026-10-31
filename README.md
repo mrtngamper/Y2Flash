@@ -1,6 +1,6 @@
 # AI slop ahead
 
-Large parts of this project were build using LLMs. If you are not fond of this way of work for whatever reason,
+Large parts of this project were build using LLMs. If you are not fond of this kind of work,
 you might want to move on now.
 
 # Y2Flash
