@@ -1,0 +1,15 @@
+[package]
+name = "y2flash"
+description = "Flash MediaTek firmware images over the preloader's USB serial port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+serialport = "4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+dirs = "5"
