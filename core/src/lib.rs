@@ -28,6 +28,8 @@ mod da;
 mod image;
 mod link;
 mod loader;
+#[cfg(target_os = "linux")]
+mod nbd;
 mod package;
 mod port;
 mod preloader;
@@ -219,7 +221,7 @@ pub fn info(loaders: &Path, path: Option<&Path>, scatter: Option<&str>, on: &mut
     let mut da = connect(loaders, image.as_mut(), on)?;
     let layout = match image.as_mut() {
         Some(image) => image_layout(image, &mut da, on),
-        None => image::read_device_layout(&mut da, on),
+        None => image::read_device_layout(&mut da),
     };
     let layout = layout
         .map_err(|e| on(Event::Log(format!("The partition table could not be read. {}", describe(&e)))))
@@ -255,6 +257,121 @@ fn image_layout(image: &mut Image, da: &mut Da, on: &mut dyn FnMut(Event)) -> Re
         on(Event::Log(format!("The layout check failed. {}", describe(&e))));
     }
     Ok((device, image.user_offset()))
+}
+
+/// What `mount` mounts and how.
+#[derive(Debug, Clone, Default)]
+pub struct MountOptions {
+    /// The partition: its number in `info`'s table, or its name (needs an image).
+    pub partition: String,
+    /// The directory to mount it on.
+    pub dir: PathBuf,
+    /// Mount it writable; otherwise the device and the mount are read-only.
+    pub writable: bool,
+    /// Extra mount options, comma-separated (e.g. "noload").
+    pub options: Option<String>,
+}
+
+/// Mount one of the device's partitions on a directory (Linux, as root).
+///
+/// The partition table is read as [`info`] does, the chosen partition is
+/// made available as a /dev/nbdN block device and mounted. This then serves
+/// the device's reads and writes until Ctrl-C unmounts it, and lets the
+/// device restart. Root, the directory and a free nbd device are checked
+/// before waiting for the device.
+///
+/// # Arguments
+///
+/// * `loaders` - folder with download agent files
+/// * `path` - optional image: names the partitions; needed in BootROM mode
+/// * `scatter` - which scatter file to use if the image has several
+/// * `m` - the partition, directory and mount options
+/// * `on` - receives log messages
+///
+/// # Errors
+///
+/// Fails if not run as root, the partition is not on the device, the mount
+/// fails, or the device stops answering.
+#[cfg(target_os = "linux")]
+pub fn mount(loaders: &Path, path: Option<&Path>, scatter: Option<&str>, m: &MountOptions, on: &mut dyn FnMut(Event)) -> Result<()> {
+    nbd::preflight(&m.dir)?;
+    let mut image = path.map(|p| Image::open(p, scatter)).transpose()?;
+    let mut da = connect(loaders, image.as_mut(), on)?;
+    let layout = match image.as_mut() {
+        Some(image) => image_layout(image, &mut da, on),
+        None => image::read_device_layout(&mut da),
+    };
+    let user = da.emmc.user;
+    let picked = layout.and_then(|(parts, offset)| {
+        let i = pick(&parts, &m.partition)?;
+        let start = parts[i].start + offset;
+        // MediaTek tables give the last partition a huge length meaning "the rest of the eMMC".
+        let size = parts[i].size.min(user.saturating_sub(start));
+        if size == 0 {
+            bail!("partition {} lies outside the eMMC", i + 1);
+        }
+        let name = parts[i].name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
+        Ok((start, size, format!("partition {}{name}", i + 1)))
+    });
+    let (start, size, label) = da.finish_on_err(picked)?;
+    on(Event::Log(format!("Mounting {label}, {} MiB at eMMC address {start:#x}.", size >> 20)));
+    let mut disk = PartitionDisk { da: &mut da, start };
+    let served = nbd::run(&mut disk, size, &m.dir, m.writable, m.options.as_deref(), on);
+    da.finish_on_err(served)?;
+    da.finish()?;
+    on(Event::Log("Done. The player now restarts.".into()));
+    Ok(())
+}
+
+/// Choose a partition by its number in `info`'s table or by name.
+///
+/// # Arguments
+///
+/// * `parts` - the device's listed partitions, sorted by start
+/// * `which` - a number from 1, or a partition name (any case)
+///
+/// # Returns
+///
+/// The partition's index in `parts`.
+///
+/// # Errors
+///
+/// Fails, listing the choices, if no partition matches.
+#[cfg(target_os = "linux")]
+fn pick(parts: &[ListedPartition], which: &str) -> Result<usize> {
+    if let Ok(n) = which.parse::<usize>() {
+        if (1..=parts.len()).contains(&n) {
+            return Ok(n - 1);
+        }
+        bail!("there is no partition {n}. The device lists partitions 1 to {}", parts.len());
+    }
+    if let Some(i) = parts.iter().position(|p| p.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(which))) {
+        return Ok(i);
+    }
+    let names: Vec<&str> = parts.iter().filter_map(|p| p.name.as_deref()).collect();
+    if names.is_empty() {
+        bail!("partitions can only be chosen by name with a firmware image (--image). Use the number from `info` instead");
+    }
+    bail!("there is no partition named {which}. The device has {}", names.join(", "))
+}
+
+/// A partition of the eMMC user area, addressed from its start.
+#[cfg(target_os = "linux")]
+struct PartitionDisk<'a> {
+    da: &'a mut Da,
+    /// The partition's eMMC address.
+    start: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl nbd::Disk for PartitionDisk<'_> {
+    fn read(&mut self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.da.read(Area::User, self.start + offset, len as u64)
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.da.write(Area::User, self.start + offset, data.len() as u64, &mut &data[..], &mut |_| {})
+    }
 }
 
 /// Describe an error and its causes for people: each part becomes a sentence
@@ -346,4 +463,23 @@ pub(crate) fn le16(b: &[u8], offset: usize) -> u16 {
 /// Read a little-endian u32 at `offset`.
 pub(crate) fn le32(b: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn part(start: u64, name: Option<&str>) -> ListedPartition {
+        ListedPartition { start, size: 512, kind: 0x83, name: name.map(str::to_string) }
+    }
+
+    #[test]
+    fn pick_by_number_or_name() {
+        let parts = [part(0, Some("CACHE")), part(512, Some("FAT"))];
+        assert_eq!(pick(&parts, "2").unwrap(), 1);
+        assert_eq!(pick(&parts, "fat").unwrap(), 1);
+        assert!(pick(&parts, "3").is_err());
+        assert!(pick(&parts, "0").is_err());
+        assert!(pick(&[part(0, None)], "FAT").is_err());
+    }
 }

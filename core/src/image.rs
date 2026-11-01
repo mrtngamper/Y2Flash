@@ -219,7 +219,6 @@ impl Image {
             on(Event::Log("The image has no MBR file, so the partition tables are not compared.".into()));
         }
         let (offset, diff) = find_table(&sectors, ours.as_deref())?;
-        on(Event::Log(format!("Found the partition table at user-area offset {offset:#x}.")));
         self.user_offset = offset;
 
         // (table name, how it differs, device sector, image sector)
@@ -662,7 +661,6 @@ fn find_table(sectors: &[(u64, Vec<u8>)], ours: Option<&[u8]>) -> Result<(u64, O
 /// # Arguments
 ///
 /// * `da` - the running download agent
-/// * `on` - receives log messages
 ///
 /// # Returns
 ///
@@ -671,10 +669,9 @@ fn find_table(sectors: &[(u64, Vec<u8>)], ours: Option<&[u8]>) -> Result<(u64, O
 /// # Errors
 ///
 /// Fails if a read fails, or no or several MBRs are found.
-pub fn read_device_layout(da: &mut Da, on: &mut dyn FnMut(Event)) -> Result<(Vec<ListedPartition>, u64)> {
+pub fn read_device_layout(da: &mut Da) -> Result<(Vec<ListedPartition>, u64)> {
     let sectors = read_candidates(da, Y2_MBR_ADDR)?;
     let (offset, _) = find_table(&sectors, None)?;
-    on(Event::Log(format!("Found the partition table at user-area offset {offset:#x}.")));
     let device = walk_tables(Y2_MBR_ADDR, &mut |pos| da.read(Area::User, pos + offset, 512))?;
     Ok((device, offset))
 }

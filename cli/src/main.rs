@@ -71,6 +71,25 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Mount a partition of the device on a directory (Linux, run with sudo).
+    /// Ctrl-C unmounts it and lets the player restart
+    #[cfg(target_os = "linux")]
+    Mount {
+        /// The partition: its number in `info`'s table, or its name (with --image)
+        partition: String,
+        /// The directory to mount it on
+        dir: PathBuf,
+        /// Firmware image: names the partitions; needed in BootROM mode
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Mount it read-only. Otherwise it is writable, and unplugging the player
+        /// before Ctrl-C has unmounted it can corrupt the file system
+        #[arg(long)]
+        readonly: bool,
+        /// Extra mount options, comma-separated (e.g. noload for a read-only ext4 with a journal to replay)
+        #[arg(short, long)]
+        options: Option<String>,
+    },
 }
 
 /// Which release and file of an online software to use.
@@ -176,6 +195,11 @@ fn run() -> Result<()> {
             };
             y2flash::flash(&image, &loaders, &opts, &mut print_event, &mut ask_repartition)?;
         }
+        #[cfg(target_os = "linux")]
+        Cmd::Mount { partition, dir, image, readonly, options } => {
+            let m = y2flash::MountOptions { partition, dir, writable: !readonly, options };
+            y2flash::mount(&loaders, image.as_deref(), scatter.as_deref(), &m, &mut print_event)?;
+        }
     }
     Ok(())
 }
@@ -231,7 +255,7 @@ fn confirm(question: &str) -> Result<bool> {
 /// * `offset` - the user-area offset, added to a scatter address to get the eMMC address
 /// * `user_size` - size of the eMMC user area; longer partitions are shown up to its end
 fn print_layout(parts: &[y2flash::ListedPartition], offset: u64, user_size: u64) {
-    println!("\nPartition table ({} partitions, user-area offset {offset:#x}):", parts.len());
+    println!("\nPartition table");
     println!("{:<3} {:<12} {:>12} {:>12} {:>10} {:>5}", "#", "NAME", "ADDRESS", "EMMC ADDR", "MiB", "TYPE");
     let mut clipped = false;
     for (i, p) in parts.iter().enumerate() {

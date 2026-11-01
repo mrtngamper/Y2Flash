@@ -13,3 +13,6 @@ ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 dirs = "5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

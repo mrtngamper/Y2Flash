@@ -89,7 +89,7 @@ impl Session {
         }
         let loader = loader::find(loaders, &self.chip)?;
         on(Event::Log(format!("Using the loader {}.", loader.path.display())));
-        let da = Da::start(self.link, self.chip, &loader, &mut |m| on(Event::Log(m)))?;
+        let da = Da::start(self.link, self.chip, &loader)?;
         let e = &da.emmc;
         on(Event::Log(format!("The eMMC has a {} MiB user area and {} KiB boot areas.", e.user >> 20, e.boot1 >> 10)));
         Ok(da)

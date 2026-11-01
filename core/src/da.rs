@@ -78,7 +78,6 @@ impl Da {
     /// * `link` - link to the device after `identify`
     /// * `chip` - the identified chip
     /// * `loader` - the agent for this chip
-    /// * `log` - receives progress messages
     ///
     /// # Returns
     ///
@@ -87,10 +86,9 @@ impl Da {
     /// # Errors
     ///
     /// Fails if the chip is unsupported, an upload is refused, the device still needs DRAM setup (BootROM mode), or no eMMC is found.
-    pub fn start(mut link: Link, chip: Chip, loader: &Loader, log: &mut dyn FnMut(String)) -> Result<Da> {
+    pub fn start(mut link: Link, chip: Chip, loader: &Loader) -> Result<Da> {
         let params = chip_params(chip.hw_code)?;
 
-        log("Starting stage 1 of the download agent.".into());
         let (r1, da1) = loader.stage(1)?;
         preloader::send_da(&mut link, r1.addr, &da1, r1.sig_len)?;
         preloader::jump_da(&mut link, r1.addr)?;
@@ -127,7 +125,6 @@ impl Da {
             e => bail!("stage-2 configuration refused ({e:#x})"),
         }
 
-        log("Starting stage 2 of the download agent.".into());
         let (r2, da2) = loader.stage(2)?;
         link.write(&r2.addr.to_be_bytes())?;
         link.write(&(da2.len() as u32).to_be_bytes())?;
