@@ -39,8 +39,9 @@ enum Cmd {
         #[command(flatten)]
         pick: Pick,
     },
-    /// Show chip and eMMC information (writes nothing). With a firmware image,
-    /// also locate and compare its partition table as a flash would. In
+    /// Show chip, eMMC and partition table information (writes nothing). With
+    /// a firmware image, also locate and compare its partition table as a
+    /// flash would, and name the partitions after its scatter file. In
     /// BootROM mode the image is needed: its preloader is started in RAM.
     Info { image: Option<PathBuf> },
     /// Flash a firmware image: a folder, a .zip, a scatter file, or (with
@@ -136,7 +137,10 @@ fn run() -> Result<()> {
         }
         Cmd::Info { image } => {
             let d = y2flash::info(&loaders, image.as_deref(), scatter.as_deref(), &mut print_event)?;
-            println!("{d:#?}");
+            println!("{:#?}\n{:#?}", d.chip, d.emmc);
+            if let Some((parts, offset)) = &d.layout {
+                print_layout(parts, *offset, d.emmc.user);
+            }
         }
         Cmd::Flash { image, software, pick, only, with_preloader, repartition, dry_run, yes } => {
             let image = match (image, software) {
@@ -217,6 +221,32 @@ fn confirm(question: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     Ok(line.trim() == "yes")
+}
+
+/// Print the partitions the device's tables list, one per line.
+///
+/// # Arguments
+///
+/// * `parts` - the listed partitions, sorted by start
+/// * `offset` - the user-area offset, added to a scatter address to get the eMMC address
+/// * `user_size` - size of the eMMC user area; longer partitions are shown up to its end
+fn print_layout(parts: &[y2flash::ListedPartition], offset: u64, user_size: u64) {
+    println!("\nPartition table ({} partitions, user-area offset {offset:#x}):", parts.len());
+    println!("{:<3} {:<12} {:>12} {:>12} {:>10} {:>5}", "#", "NAME", "ADDRESS", "EMMC ADDR", "MiB", "TYPE");
+    let mut clipped = false;
+    for (i, p) in parts.iter().enumerate() {
+        let name = p.name.as_deref().unwrap_or("-");
+        let addr = p.start + offset;
+        // MediaTek tables give the last partition a huge length meaning "the rest of the eMMC".
+        let rest = user_size.saturating_sub(addr);
+        let (size, mark) = if user_size > 0 && p.size > rest { (rest, "*") } else { (p.size, "") };
+        clipped |= !mark.is_empty();
+        let mib = format!("{:.1}{mark}", size as f64 / 1048576.0);
+        println!("{:<3} {name:<12} {:>#12x} {addr:>#12x} {mib:>10} {:>#5x}", i + 1, p.start, p.kind);
+    }
+    if clipped {
+        println!("* listed as longer than the eMMC; shown up to its end");
+    }
 }
 
 /// Print a log line, or update a progress line in place.

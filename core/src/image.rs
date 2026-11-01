@@ -25,6 +25,18 @@ pub struct Step {
     pub boot_header: bool,
 }
 
+/// A partition listed in the device's MBR and EBR tables.
+#[derive(Debug, Clone)]
+pub struct ListedPartition {
+    /// Start in scatter addresses; on the eMMC it lies at this plus the user-area offset.
+    pub start: u64,
+    pub size: u64,
+    /// The entry's type byte, e.g. 0x83 (Linux) or 0x0C (FAT32).
+    pub kind: u8,
+    /// The scatter partition starting here, if an image was given.
+    pub name: Option<String>,
+}
+
 /// An opened firmware image with its scatter parsed.
 pub struct Image {
     pkg: Package,
@@ -39,6 +51,11 @@ pub struct Image {
 /// none, boot1 + boot2 (8 MiB), and the Y2's 0xB80000. They must stay more
 /// than 0x80000 apart, or an EBR right after the MBR could be taken for it.
 const USER_OFFSETS: [u64; 3] = [0, 0x80_0000, 0xB8_0000];
+
+/// The MBR's scatter address (`physical_start_addr`, not `linear_start_addr`)
+/// in the Y2's firmware, assumed by [`read_device_layout`] when there is no
+/// image to take it from.
+const Y2_MBR_ADDR: u64 = 0;
 
 impl Image {
     /// Open an image and parse its scatter.
@@ -196,10 +213,7 @@ impl Image {
     /// Returns an error if no or several partition tables are found, or a read fails.
     pub fn locate(&mut self, da: &mut Da, on: &mut dyn FnMut(Event)) -> Result<Vec<String>> {
         let mbr_addr = self.mbr_addr();
-        let mut sectors = vec![];
-        for offset in USER_OFFSETS {
-            sectors.push((offset, da.read(Area::User, mbr_addr + offset, 512)?));
-        }
+        let sectors = read_candidates(da, mbr_addr)?;
         let ours = self.table_file("MBR")?;
         if ours.is_none() {
             on(Event::Log("The image has no MBR file, so the partition tables are not compared.".into()));
@@ -271,9 +285,60 @@ impl Image {
     /// Fails if the device's tables cannot be read or do not fit the scatter
     /// file (see [`check_device_layout`]).
     pub fn check_device_partitions(&mut self, da: &mut Da, on: &mut dyn FnMut(Event)) -> Result<()> {
+        let device = self.device_layout(da)?;
+        self.check_layout(&device, on)
+    }
+
+    /// Read the partitions the device's tables list, named after the scatter
+    /// partitions that start at the same address. Call it after [`Image::locate`].
+    ///
+    /// # Arguments
+    ///
+    /// * `da` - the running download agent (reads the MBR and each EBR)
+    ///
+    /// # Returns
+    ///
+    /// The listed partitions, sorted by start.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a read fails or a table the chain points to is missing.
+    pub fn device_layout(&mut self, da: &mut Da) -> Result<Vec<ListedPartition>> {
         let offset = self.user_offset;
-        let device = walk_tables(self.mbr_addr(), &mut |pos| da.read(Area::User, pos + offset, 512))?;
-        check_device_layout(&self.parts, &device)?;
+        let mut device = walk_tables(self.mbr_addr(), &mut |pos| da.read(Area::User, pos + offset, 512))?;
+        for p in &mut device {
+            p.name = self
+                .parts
+                .iter()
+                .find(|s| s.area == Some(Area::User) && s.addr == p.start)
+                .map(|s| s.name.clone());
+        }
+        Ok(device)
+    }
+
+    /// Where scatter address 0 of the user area lies on the device, as found
+    /// by [`Image::locate`].
+    ///
+    /// # Returns
+    ///
+    /// The user-area offset in bytes.
+    pub fn user_offset(&self) -> u64 {
+        self.user_offset
+    }
+
+    /// Check that partitions read with [`Image::device_layout`] are the ones
+    /// this image's scatter file describes.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - the device's listed partitions
+    /// * `on` - receives log messages
+    ///
+    /// # Errors
+    ///
+    /// Fails if they do not fit the scatter file (see [`check_device_layout`]).
+    pub fn check_layout(&self, device: &[ListedPartition], on: &mut dyn FnMut(Event)) -> Result<()> {
+        check_device_layout(&self.parts, device)?;
         on(Event::Log(format!("The device's {} listed partitions match this image's scatter file.", device.len())));
         Ok(())
     }
@@ -590,6 +655,48 @@ fn find_table(sectors: &[(u64, Vec<u8>)], ours: Option<&[u8]>) -> Result<(u64, O
     }
 }
 
+/// Read the device's partition tables without an image: look for the MBR at
+/// the Y2's scatter address plus each of [`USER_OFFSETS`] and walk the chain
+/// from there.
+///
+/// # Arguments
+///
+/// * `da` - the running download agent
+/// * `on` - receives log messages
+///
+/// # Returns
+///
+/// The listed partitions (unnamed, sorted by start) and the user-area offset.
+///
+/// # Errors
+///
+/// Fails if a read fails, or no or several MBRs are found.
+pub fn read_device_layout(da: &mut Da, on: &mut dyn FnMut(Event)) -> Result<(Vec<ListedPartition>, u64)> {
+    let sectors = read_candidates(da, Y2_MBR_ADDR)?;
+    let (offset, _) = find_table(&sectors, None)?;
+    on(Event::Log(format!("Found the partition table at user-area offset {offset:#x}.")));
+    let device = walk_tables(Y2_MBR_ADDR, &mut |pos| da.read(Area::User, pos + offset, 512))?;
+    Ok((device, offset))
+}
+
+/// Read the sector at an MBR address plus each of [`USER_OFFSETS`].
+///
+/// # Arguments
+///
+/// * `da` - the running download agent
+/// * `mbr_addr` - the MBR's scatter address
+///
+/// # Returns
+///
+/// (offset, sector) for each offset, as [`find_table`] takes them.
+///
+/// # Errors
+///
+/// Fails if a read fails.
+fn read_candidates(da: &mut Da, mbr_addr: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+    USER_OFFSETS.iter().map(|&offset| Ok((offset, da.read(Area::User, mbr_addr + offset, 512)?))).collect()
+}
+
 /// Follow a chain of partition tables (an MBR and the EBRs it links to) and
 /// collect the partitions they list. Every entry counts from the position of
 /// its own table, as on MediaTek devices; an entry of type 0x05 links to the
@@ -602,13 +709,13 @@ fn find_table(sectors: &[(u64, Vec<u8>)], ours: Option<&[u8]>) -> Result<(u64, O
 ///
 /// # Returns
 ///
-/// (start, length) of each listed partition in scatter addresses, sorted.
+/// Each listed partition (unnamed) in scatter addresses, sorted by start.
 ///
 /// # Errors
 ///
 /// Fails if a read fails, a table has no 55 AA signature, or the chain is
 /// longer than 16 tables (a loop).
-fn walk_tables(mbr_addr: u64, read: &mut dyn FnMut(u64) -> Result<Vec<u8>>) -> Result<Vec<(u64, u64)>> {
+fn walk_tables(mbr_addr: u64, read: &mut dyn FnMut(u64) -> Result<Vec<u8>>) -> Result<Vec<ListedPartition>> {
     let mut parts = vec![];
     let mut tables = vec![mbr_addr];
     let mut count = 0;
@@ -627,11 +734,11 @@ fn walk_tables(mbr_addr: u64, read: &mut dyn FnMut(u64) -> Result<Vec<u8>>) -> R
             match e[4] {
                 0 => {}
                 0x05 => tables.push(pos + start * 512),
-                _ => parts.push((pos + start * 512, len * 512)),
+                kind => parts.push(ListedPartition { start: pos + start * 512, size: len * 512, kind, name: None }),
             }
         }
     }
-    parts.sort();
+    parts.sort_by_key(|p| p.start);
     Ok(parts)
 }
 
@@ -642,15 +749,15 @@ fn walk_tables(mbr_addr: u64, read: &mut dyn FnMut(u64) -> Result<Vec<u8>>) -> R
 /// # Arguments
 ///
 /// * `parts` - the scatter file's partitions
-/// * `device` - (start, length) of the device's listed partitions, from [`walk_tables`]
+/// * `device` - the device's listed partitions, from [`walk_tables`]
 ///
 /// # Errors
 ///
 /// Fails, naming the partition, if the device uses a different layout.
-fn check_device_layout(parts: &[Partition], device: &[(u64, u64)]) -> Result<()> {
+fn check_device_layout(parts: &[Partition], device: &[ListedPartition]) -> Result<()> {
     // Addresses from 0xFFFF0000 on are counted from the end of the eMMC, not real positions.
     let user: Vec<&Partition> = parts.iter().filter(|p| p.area == Some(Area::User) && p.addr < 0xFFFF_0000).collect();
-    for &(start, len) in device {
+    for &ListedPartition { start, size: len, .. } in device {
         let Some(p) = user.iter().find(|p| p.addr == start) else {
             bail!(
                 "the device has a partition at {start:#x} that this image's scatter file does not have. \
@@ -667,7 +774,7 @@ fn check_device_layout(parts: &[Partition], device: &[(u64, u64)]) -> Result<()>
         }
     }
     for p in &user {
-        if let Some(&(start, _)) = device.iter().find(|&&(start, len)| start < p.addr && p.addr < start + len) {
+        if let Some(&ListedPartition { start, .. }) = device.iter().find(|d| d.start < p.addr && p.addr < d.start + d.size) {
             bail!(
                 "{} would start inside the device's partition at {start:#x}. The device uses a different \
                  partition layout. Nothing was written",
@@ -746,4 +853,36 @@ fn read_up_to(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A table sector with the given (type, start sector, sector count) entries.
+    fn table(entries: &[(u8, u32, u32)]) -> Vec<u8> {
+        let mut s = vec![0u8; 512];
+        for (i, &(kind, start, len)) in entries.iter().enumerate() {
+            let e = 0x1BE + i * 16;
+            s[e + 4] = kind;
+            s[e + 8..e + 12].copy_from_slice(&start.to_le_bytes());
+            s[e + 12..e + 16].copy_from_slice(&len.to_le_bytes());
+        }
+        s[0x1FE..].copy_from_slice(&[0x55, 0xAA]);
+        s
+    }
+
+    #[test]
+    fn walk_tables_follows_ebrs_and_keeps_types() {
+        let mbr = 0x1000;
+        let ebr = mbr + 100 * 512;
+        let sectors = HashMap::from([
+            (mbr, table(&[(0x83, 8, 16), (0x05, 100, 1)])),
+            (ebr, table(&[(0x0C, 4, 32)])),
+        ]);
+        let parts = walk_tables(mbr, &mut |pos| Ok(sectors[&pos].clone())).unwrap();
+        let got: Vec<(u64, u64, u8)> = parts.iter().map(|p| (p.start, p.size, p.kind)).collect();
+        assert_eq!(got, [(mbr + 8 * 512, 16 * 512, 0x83), (ebr + 4 * 512, 32 * 512, 0x0C)]);
+    }
 }

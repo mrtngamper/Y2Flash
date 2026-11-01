@@ -20,8 +20,8 @@ cargo run --release -- flash rom_y2.zip --dry-run   # show what would be written
 cargo run --release -- flash rom_y2.zip             # then power off the player and plug it in
 cargo run --release -- flash rom_y2.zip --only BOOTIMG,RECOVERY
 cargo run --release -- flash --software solar --repartition   # other layout, erases internal storage
-cargo run --release -- info                         # chip and eMMC sizes, writes nothing
-cargo run --release -- info rom_y2.zip              # same, also works in BootROM mode
+cargo run --release -- info                         # chip, eMMC sizes and partition table, writes nothing
+cargo run --release -- info rom_y2.zip              # same, names partitions, also works in BootROM mode
 ```
 
 On Linux your user must be in the `dialout` group to open the device.

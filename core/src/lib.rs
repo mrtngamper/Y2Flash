@@ -36,7 +36,7 @@ mod session;
 mod sparse;
 
 pub use da::{Area, Emmc};
-pub use image::Step;
+pub use image::{ListedPartition, Step};
 pub use preloader::Chip;
 
 use anyhow::{bail, Result};
@@ -76,6 +76,9 @@ pub enum Event {
 pub struct Device {
     pub chip: Chip,
     pub emmc: Emmc,
+    /// The partitions the device's tables list, and the user-area offset
+    /// their scatter addresses are moved by; None if the tables could not be read.
+    pub layout: Option<(Vec<ListedPartition>, u64)>,
 }
 
 /// Work out what `flash` would write, without touching any device.
@@ -189,10 +192,12 @@ fn agree_to_layout(changed: &[String], opts: &Options, confirm: &mut dyn FnMut(&
     Ok(true)
 }
 
-/// Read the chip and eMMC sizes, then let the device restart. Writes nothing.
-/// An image is only needed in BootROM mode (for its preloader); if given, it
-/// is also checked against the chip, and its partition table is located on
-/// the device and compared as a flash would (the result is logged).
+/// Read the chip, the eMMC sizes and the partitions the device's tables list,
+/// then let the device restart. Writes nothing. An image is only needed in
+/// BootROM mode (for its preloader); if given, it is also checked against
+/// the chip, its partition table is located on the device and compared as a
+/// flash would (the result is logged), and its scatter file names the
+/// partitions. Without one, the tables are looked for where the Y2 has them.
 ///
 /// # Arguments
 ///
@@ -203,7 +208,8 @@ fn agree_to_layout(changed: &[String], opts: &Options, confirm: &mut dyn FnMut(&
 ///
 /// # Returns
 ///
-/// The chip and eMMC information.
+/// The chip, eMMC and partition information. A partition table that cannot
+/// be read is logged and leaves `layout` at None.
 ///
 /// # Errors
 ///
@@ -211,22 +217,44 @@ fn agree_to_layout(changed: &[String], opts: &Options, confirm: &mut dyn FnMut(&
 pub fn info(loaders: &Path, path: Option<&Path>, scatter: Option<&str>, on: &mut dyn FnMut(Event)) -> Result<Device> {
     let mut image = path.map(|p| Image::open(p, scatter)).transpose()?;
     let mut da = connect(loaders, image.as_mut(), on)?;
-    if let Some(image) = image.as_mut() {
-        let checked = image.locate(&mut da, on).and_then(|changed| {
-            if changed.is_empty() {
-                image.check_device_partitions(&mut da, on)
-            } else {
-                on(Event::Log("Flashing this image would repartition the device and erase its internal storage.".into()));
-                Ok(())
-            }
-        });
-        if let Err(e) = checked {
-            on(Event::Log(format!("The layout check failed. {}", describe(&e))));
-        }
-    }
-    let device = Device { chip: da.chip.clone(), emmc: da.emmc.clone() };
+    let layout = match image.as_mut() {
+        Some(image) => image_layout(image, &mut da, on),
+        None => image::read_device_layout(&mut da, on),
+    };
+    let layout = layout
+        .map_err(|e| on(Event::Log(format!("The partition table could not be read. {}", describe(&e)))))
+        .ok();
+    let device = Device { chip: da.chip.clone(), emmc: da.emmc.clone(), layout };
     da.finish()?;
     Ok(device)
+}
+
+/// Find the device's partition tables as a flash of `image` would, read the
+/// partitions they list, and log how they compare with the image.
+///
+/// # Arguments
+///
+/// * `image` - the image whose scatter file names the partitions
+/// * `da` - the running download agent
+/// * `on` - receives log messages
+///
+/// # Returns
+///
+/// The listed partitions and the user-area offset.
+///
+/// # Errors
+///
+/// Fails if the tables cannot be found or read. A layout that differs from
+/// the image's is only logged.
+fn image_layout(image: &mut Image, da: &mut Da, on: &mut dyn FnMut(Event)) -> Result<(Vec<ListedPartition>, u64)> {
+    let changed = image.locate(da, on)?;
+    let device = image.device_layout(da)?;
+    if !changed.is_empty() {
+        on(Event::Log("Flashing this image would repartition the device and erase its internal storage.".into()));
+    } else if let Err(e) = image.check_layout(&device, on) {
+        on(Event::Log(format!("The layout check failed. {}", describe(&e))));
+    }
+    Ok((device, image.user_offset()))
 }
 
 /// Describe an error and its causes for people: each part becomes a sentence
