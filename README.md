@@ -22,7 +22,7 @@ cargo run --release -- flash rom_y2.zip --only BOOTIMG,RECOVERY
 cargo run --release -- flash --software solar --repartition   # other layout, erases internal storage
 cargo run --release -- info                         # chip, eMMC sizes and partition table, writes nothing
 cargo run --release -- info rom_y2.zip              # same, names partitions, also works in BootROM mode
-sudo target/release/y2flash mount 2 /mnt/partition   # mount partition 2 from `info`. Use Ctrl-C to unmount
+cargo run --release --config 'target.x86_64-unknown-linux-gnu.runner="sudo"' -- mount 2 /mnt/partition  # mount partition 2 from `info`. Use Ctrl-C to unmount
 ```
 
 On Linux your user must be in the `dialout` group to open the device.
